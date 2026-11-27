@@ -304,8 +304,8 @@ fn history_path() -> std::path::PathBuf {
     batteryhub::history::History::path(EDITION)
 }
 
-/// A notification-area icon to show: device key, text in the icon, colour, level, tooltip.
-type TrayIcon = (String, String, COLORREF, i32, String);
+/// A notification-area icon to show: device key, text, colour, level, tooltip and optional glyph.
+type TrayIcon = (String, String, COLORREF, i32, String, Option<char>);
 
 struct Tracked {
     status: DeviceStatus,
@@ -2129,25 +2129,31 @@ impl App {
         let normal = if light { rgb(20, 20, 20) } else { rgb(255, 255, 255) };
         let size = unsafe { windows::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXSMICON, windows::Win32::UI::HiDpi::GetDpiForSystem()) };
         let devices = self.visible();
+        // Opt-in for this prototype; ordinary installations retain the original icons.
+        let stacked = std::env::var_os("BATTERYHUB_TRAY_DEVICE_GLYPHS").as_deref() == Some(std::ffi::OsStr::new("1"));
         let mut wanted: Vec<TrayIcon> = devices
             .iter()
             .enumerate()
             .map(|(i, d)| {
                 let th = settings::threshold(SETTINGS_KEY, &d.key);
                 let text = if d.percent >= 0 { d.percent.to_string() } else { "?".into() };
-                (d.key.clone(), text, ui::level_color(d, light, normal, th), d.percent, self.tip_text(i))
+                (d.key.clone(), text, ui::level_color(d, light, normal, th), d.percent, self.tip_text(i), stacked.then(|| d.kind.glyph()))
             })
             .collect();
         if wanted.is_empty() {
-            wanted.push(("\u{0}none".into(), "-".into(), normal, -1, tr("BatteryHub: no devices found")));
+            wanted.push(("\u{0}none".into(), "-".into(), normal, -1, tr("BatteryHub: no devices found"), None));
         }
         let keep: HashSet<String> = wanted.iter().map(|w| w.0.clone()).collect();
         let stale: Vec<String> = self.tray.keys().filter(|k| !keep.contains(*k)).cloned().collect();
         for k in stale {
             self.remove_tray_icon(&k);
         }
-        for (key, text, color, level, tip) in wanted {
-            let Some(icon) = ui::number_icon(&text, color, level, size, light) else {
+        for (key, text, color, level, tip, glyph) in wanted {
+            let rendered = match glyph {
+                Some(g) => ui::device_number_icon(&text, color, level, size, light, g),
+                None => ui::number_icon(&text, color, level, size, light),
+            };
+            let Some(icon) = rendered else {
                 continue;
             };
             // The id comes from the device key, so a device keeps its icon id across restarts and
