@@ -1,4 +1,4 @@
-//! Isolated hybrid layout experiment: three native tray anchors, one external
+//! Isolated hybrid layout experiment: four native tray anchors, one external
 //! click-through layered window. No settings, polling, installer or Explorer injection.
 use batteryhub::{DeviceKind, ui};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -28,7 +28,7 @@ fn rect_of(a: &Anchor) -> Option<RECT> {
 }
 
 fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
-    if anchors.len() != 3 || slot <= 0 { return None; }
+    if anchors.len() != 4 || slot <= 0 { return None; }
     unsafe {
         let bar = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         if !IsWindowVisible(bar).as_bool() { return None; }
@@ -45,14 +45,14 @@ fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
         // Only join our own adjacent anchors. An icon between them invalidates the span.
         let c = |r: &RECT| (r.left+r.right)/2;
         let a = c(&rs[1])-c(&rs[0]);
-        let d = c(&rs[2])-c(&rs[1]);
-        if a < slot || d < slot || a > slot*5/2 || d > slot*5/2 || (a-d).abs() > 2 ||
-            rs.windows(2).any(|p| p[0].right > p[1].left || (p[0].top-p[1].top).abs() > 2) {
+        if a < slot || a > slot*5/2 ||
+            rs.windows(2).any(|p| (c(&p[1])-c(&p[0])-a).abs() > 2 ||
+                (p[0].right-p[1].left).abs() > 2 || (p[0].top-p[1].top).abs() > 2) {
             return None;
         }
         let x = rs[0].left;
-        let width = rs[2].right - x;
-        if width < slot * 4 || width > slot * 8 { return None; }
+        let width = rs[3].right - x;
+        if width < slot * 6 || width > slot * 10 { return None; }
         // Do not draw over foreground full-screen apps.
         let fg = GetForegroundWindow();
         let mut f = RECT::default();
@@ -78,7 +78,8 @@ fn set_anchor_icons(anchors: &[Anchor], blank: Option<HICON>) -> bool {
 fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), color: COLORREF, slot: i32) -> bool {
     let (x,y,width,height) = geom;
     unsafe {
-        let dc = CreateCompatibleDC(None);
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(Some(screen));
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: width, biHeight: -height,
@@ -87,21 +88,26 @@ fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), color: COLORREF, slot: i32) -> boo
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
         let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
-            let _ = DeleteDC(dc); return false;
+            let _ = DeleteDC(dc); let _ = ReleaseDC(None, screen); return false;
         };
         let old = SelectObject(dc, HGDIOBJ(bmp.0));
         let px = std::slice::from_raw_parts_mut(bits as *mut u32, (width*height) as usize);
         px.fill(0);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, ui::rgb(255,255,255));
-        let glyph_f = ui::font((slot*9/10).max(12), 400, ui::icon_font_face());
-        let number_f = ui::font((slot*3/4).max(10), 500, "Segoe UI");
+        // Match the Personal-XAML screenshot: device glyph and percentage side by side.
+        let glyph_f = ui::font(slot, 400, ui::icon_font_face());
+        let number_f = ui::font((slot*7/8).max(12), 400, "Segoe UI");
         let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
         for (i, kind, text) in [(0,DeviceKind::Headset,"85%"), (1,DeviceKind::Mouse,"72%")] {
             let l = width*i/2;
             let r = width*(i+1)/2;
-            let mut icon = RECT {left:l, top:0, right:r, bottom:height/2+2};
-            let mut num = RECT {left:l, top:height/2-2, right:r, bottom:height};
+            let center = (l+r)/2;
+            let glyph_w = slot + 2;
+            let num_w = slot*2;
+            let start = (center-(glyph_w+num_w+3)/2).max(l);
+            let mut icon = RECT {left:start, top:0, right:start+glyph_w, bottom:height};
+            let mut num = RECT {left:start+glyph_w+3, top:0, right:r, bottom:height};
             SelectObject(dc,HGDIOBJ(glyph_f.0));
             ui::draw_text(dc,&kind.glyph().to_string(),&mut icon,flags);
             SelectObject(dc,HGDIOBJ(number_f.0));
@@ -117,12 +123,16 @@ fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), color: COLORREF, slot: i32) -> boo
         let src = POINT{x:0,y:0};
         let sz = SIZE{cx:width,cy:height};
         let blend = BLENDFUNCTION{BlendOp:AC_SRC_OVER as u8, BlendFlags:0, SourceConstantAlpha:255, AlphaFormat:AC_SRC_ALPHA as u8};
-        let ok = UpdateLayeredWindow(hwnd,None,Some(&pt),Some(&sz),Some(dc),Some(&src),COLORREF(0),Some(&blend),ULW_ALPHA).is_ok();
+        let ink = px.iter().filter(|&&p| p >> 24 != 0).count();
+        let result = UpdateLayeredWindow(hwnd,Some(screen),Some(&pt),Some(&sz),Some(dc),Some(&src),COLORREF(0),Some(&blend),ULW_ALPHA);
+        println!("Paint: {ink} visible pixels; UpdateLayeredWindow={result:?}");
+        let ok = ink > 0 && result.is_ok();
         SelectObject(dc,old);
         let _=DeleteObject(HGDIOBJ(glyph_f.0));
         let _=DeleteObject(HGDIOBJ(number_f.0));
         let _=DeleteObject(HGDIOBJ(bmp.0));
         let _=DeleteDC(dc);
+        let _=ReleaseDC(None,screen);
         ok
     }
 }
@@ -144,7 +154,7 @@ fn main() {
         let and=vec![255u8;bytes]; let xor=vec![0u8;bytes];
         let Ok(blank)=CreateIcon(Some(inst.into()),slot,slot,1,1,and.as_ptr(),xor.as_ptr()) else {let _=DestroyWindow(overlay);let _=DestroyWindow(owner);return;};
         let mut anchors=Vec::new();
-        for id in 1..=3u32 {
+        for id in 1..=4u32 {
             let Some(marker)=ui::number_icon(&id.to_string(),color,-1,slot,light) else {continue;};
             let mut data=NOTIFYICONDATAW{cbSize:size_of::<NOTIFYICONDATAW>() as u32,hWnd:owner,uID:id,uFlags:NIF_ICON|NIF_TIP,hIcon:marker,..Default::default()};
             ui::fill_wide(&mut data.szTip,&format!("Hybrid PREVIEW anchor {id}"));
@@ -177,12 +187,20 @@ fn main() {
                 }
                 if let Some(g)=candidate {
                     if active.is_none() && previous==Some(g) && paint(overlay,g,color,slot) {
-                        if set_anchor_icons(&anchors,Some(blank)) {
-                            let _=ShowWindow(overlay,SW_SHOWNOACTIVATE);
+                        let raised = SetWindowPos(overlay,Some(HWND_TOPMOST),g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+                        println!("Raise overlay: {raised:?}; visible={}",IsWindowVisible(overlay).as_bool());
+                        if raised.is_ok() && IsWindowVisible(overlay).as_bool() && set_anchor_icons(&anchors,Some(blank)) {
                             active=Some(g);
                             println!("Overlay active: x={} y={} width={} height={}",g.0,g.1,g.2,g.3);
-                        } else {set_anchor_icons(&anchors,None);}
+                        } else {
+                            let _=ShowWindow(overlay,SW_HIDE);
+                            set_anchor_icons(&anchors,None);
+                        }
                     }
+                }
+                if active.is_some() && candidate==active {
+                    // Explorer can raise its own topmost window after shell layout changes.
+                    let _=SetWindowPos(overlay,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
                 }
                 previous=candidate;
             }
