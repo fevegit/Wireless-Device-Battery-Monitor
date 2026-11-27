@@ -224,7 +224,17 @@ fn make_font(px: i32, weight: i32, face: &str, fallback: &str, fallback_px: i32)
 
 // The static renderer below ports the ink-mask and font routines from the
 // published experimental XAML contribution. Only presentation is external.
-fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), _color: COLORREF, _slot: i32) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DemoState { headset: i32, mouse: i32, charging: bool }
+const DEMO_STATES: [DemoState; 5] = [
+    DemoState { headset: 49, mouse: 95, charging: true },
+    DemoState { headset: 48, mouse: 100, charging: true },
+    DemoState { headset: 15, mouse: 100, charging: false },
+    DemoState { headset: 9, mouse: 99, charging: false },
+    DemoState { headset: 100, mouse: 8, charging: true },
+];
+
+fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), _color: COLORREF, _slot: i32, state: DemoState) -> bool {
     let (x,y,width,height) = geom;
     unsafe {
         let bar = FindWindowW(w!("Shell_TrayWnd"), None).ok();
@@ -236,13 +246,17 @@ fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), _color: COLORREF, _slot: i32) -> b
         let icons = make_font(px(16.0),400,"Segoe Fluent Icons","Segoe MDL2 Assets",0);
         let text = make_font(px(13.0),400,"Segoe UI Variable Text","Segoe UI",px(12.0));
         let bolt = make_font(px(11.0),400,"Segoe Fluent Icons","Segoe MDL2 Assets",0);
-        let pieces = [
+        let low = |v| if v <= 15 { ui::low_color(light) } else { fg };
+        let mut pieces = vec![
             (mask(&DeviceKind::Headset.glyph().to_string(),icons,light),fg,px(5.0)),
-            (mask("49%",text,light),fg,px(14.0)),
+            (mask(&format!("{}%",state.headset),text,light),low(state.headset),px(14.0)),
             (mask(&DeviceKind::Mouse.glyph().to_string(),icons,light),fg,px(5.0)),
-            (mask("95%",text,light),fg,px(2.0)),
-            (mask("\u{E945}",bolt,light),ui::charging_color(light),0),
+            (mask(&format!("{}%",state.mouse),text,light),low(state.mouse),if state.charging {px(2.0)} else {0}),
         ];
+        if state.charging {
+            let c=if state.mouse==100 {ui::full_color(light)} else {ui::charging_color(light)};
+            pieces.push((mask("\u{E945}",bolt,light),c,0));
+        }
         for f in [icons,text,bolt] {let _=DeleteObject(HGDIOBJ(f.0));}
         let content: i32 = pieces.iter().map(|(m,_,gap)|m.w+gap).sum();
         if content > width || pieces.iter().any(|(m,_,_)|m.w==0 || m.h>height) {
@@ -323,6 +337,10 @@ fn main() {
         let raw=owner.0 as isize;
         std::thread::spawn(move||{let mut s=String::new();let _=std::io::stdin().read_line(&mut s);let _=PostMessageW(Some(HWND(raw as *mut core::ffi::c_void)),WM_CLOSE,WPARAM(0),LPARAM(0));});
         SetTimer(Some(owner),1,250,None);
+        let cycle=std::env::args().any(|a|a=="--cycle");
+        let started=std::time::Instant::now();
+        let mut rendered=None;
+        if cycle {println!("QA cycle: synthetic battery state changes every 5 seconds.");}
         let mut active=None;
         let mut previous=None;
         let mut last_rects = Vec::new();
@@ -340,6 +358,7 @@ fn main() {
                     println!("Anchor rectangles: {rects:?}");
                     last_rects = rects;
                 }
+                let state=DEMO_STATES[if cycle {(started.elapsed().as_secs()/5) as usize % DEMO_STATES.len()} else {0}];
                 let geometry=layout(&anchors,slot);
                 if let Ok((g,r))=rx.try_recv() {
                     probe_pending=false;
@@ -367,18 +386,33 @@ fn main() {
                     let _=ShowWindow(overlay,SW_HIDE);
                     set_anchor_icons(&anchors,None);
                     active=None;
+                    rendered=None;
                     println!("Overlay hidden; anchors restored.");
                 }
                 if let Some(g)=candidate {
-                    if active.is_none() && previous==Some(g) && paint(overlay,g,color,slot) {
+                    if active.is_none() && previous==Some(g) && paint(overlay,g,color,slot,state) {
                         let raised = SetWindowPos(overlay,Some(HWND_TOPMOST),g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_SHOWWINDOW);
                         println!("Raise overlay: {raised:?}; visible={}",IsWindowVisible(overlay).as_bool());
                         if raised.is_ok() && IsWindowVisible(overlay).as_bool() && set_anchor_icons(&anchors,Some(blank)) {
                             active=Some(g);
+                            rendered=Some(state);
                             println!("Overlay active: x={} y={} width={} height={}",g.0,g.1,g.2,g.3);
                         } else {
                             let _=ShowWindow(overlay,SW_HIDE);
                             set_anchor_icons(&anchors,None);
+                        }
+                    }
+                }
+                if let Some(g)=active {
+                    if rendered!=Some(state) {
+                        if paint(overlay,g,color,slot,state) {
+                            rendered=Some(state);
+                            println!("QA rendered: {state:?}");
+                        } else {
+                            let _=ShowWindow(overlay,SW_HIDE);
+                            set_anchor_icons(&anchors,None);
+                            active=None;
+                            rendered=None;
                         }
                     }
                 }
