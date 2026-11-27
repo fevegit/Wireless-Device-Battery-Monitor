@@ -1,4 +1,4 @@
-//! Isolated hybrid layout experiment: four native tray anchors, one external
+//! Isolated hybrid layout experiment: five native tray anchors (one guard slot), one external
 //! click-through layered window. No settings, polling, installer or Explorer injection.
 use batteryhub::{DeviceKind, ui};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -28,7 +28,7 @@ fn rect_of(a: &Anchor) -> Option<RECT> {
 }
 
 fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
-    if anchors.len() != 4 || slot <= 0 { return None; }
+    if anchors.len() != 5 || slot <= 0 { return None; }
     unsafe {
         let bar = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         if !IsWindowVisible(bar).as_bool() { return None; }
@@ -50,8 +50,11 @@ fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
                 (p[0].right-p[1].left).abs() > 2 || (p[0].top-p[1].top).abs() > 2) {
             return None;
         }
-        let x = rs[0].left;
-        let width = rs[3].right - x;
+        // Personal-XAML can coexist with this test and the shell's chevron
+        // may be drawn over the leftmost reported anchor. Keep that entire
+        // slot free of overlay pixels; only render in the remaining four.
+        let x = rs[1].left;
+        let width = rs[4].right - x;
         if width < slot * 6 || width > slot * 10 { return None; }
         // Do not draw over foreground full-screen apps.
         let fg = GetForegroundWindow();
@@ -275,14 +278,14 @@ fn main() {
         let and=vec![255u8;bytes]; let xor=vec![0u8;bytes];
         let Ok(blank)=CreateIcon(Some(inst.into()),slot,slot,1,1,and.as_ptr(),xor.as_ptr()) else {let _=DestroyWindow(overlay);let _=DestroyWindow(owner);return;};
         let mut anchors=Vec::new();
-        for id in 1..=4u32 {
+        for id in 1..=5u32 {
             let Some(marker)=ui::number_icon(&id.to_string(),color,-1,slot,light) else {continue;};
             let mut data=NOTIFYICONDATAW{cbSize:size_of::<NOTIFYICONDATAW>() as u32,hWnd:owner,uID:id,uFlags:NIF_ICON|NIF_TIP,hIcon:marker,..Default::default()};
             ui::fill_wide(&mut data.szTip,&format!("Hybrid PREVIEW anchor {id}"));
             if Shell_NotifyIconW(NIM_ADD,&data).as_bool() {anchors.push(Anchor{data,marker});} else {let _=DestroyIcon(marker);}
         }
         println!("Hybrid preview: {} anchors. Drag numbered icons together to the visible tray.",anchors.len());
-        println!("Only when adjacent: show external widget with synthetic 49% and 95% (charging).");
+        println!("Only when adjacent: leave the leftmost anchor clear for Windows, then show 49% and 95% (charging).");
         println!("Press ENTER to remove all preview icons and the overlay.");
         let raw=owner.0 as isize;
         std::thread::spawn(move||{let mut s=String::new();let _=std::io::stdin().read_line(&mut s);let _=PostMessageW(Some(HWND(raw as *mut core::ffi::c_void)),WM_CLOSE,WPARAM(0),LPARAM(0));});
