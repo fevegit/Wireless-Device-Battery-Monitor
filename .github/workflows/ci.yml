@@ -37,3 +37,8 @@ jobs:
         with:
           name: BatteryHub-Taskbar-Setup
           path: installer/target/release/BatteryHub-Taskbar-Setup.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Native-Tray-Preview
+          path: target/release/native-tray-preview.exe
