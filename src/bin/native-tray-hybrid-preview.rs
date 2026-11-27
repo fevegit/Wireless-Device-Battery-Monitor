@@ -1,4 +1,4 @@
-//! Isolated hybrid layout experiment: five native tray anchors (one guard slot), one external
+//! Isolated hybrid layout experiment: four native tray anchors with a read-only overflow-button check, one external
 //! click-through layered window. No settings, polling, installer or Explorer injection.
 use batteryhub::{DeviceKind, ui};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -28,7 +28,7 @@ fn rect_of(a: &Anchor) -> Option<RECT> {
 }
 
 fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
-    if anchors.len() != 5 || slot <= 0 { return None; }
+    if anchors.len() != 4 || slot <= 0 { return None; }
     unsafe {
         let bar = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         if !IsWindowVisible(bar).as_bool() { return None; }
@@ -50,11 +50,8 @@ fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
                 (p[0].right-p[1].left).abs() > 2 || (p[0].top-p[1].top).abs() > 2) {
             return None;
         }
-        // Personal-XAML can coexist with this test and the shell's chevron
-        // may be drawn over the leftmost reported anchor. Keep that entire
-        // slot free of overlay pixels; only render in the remaining four.
-        let x = rs[1].left;
-        let width = rs[4].right - x;
+        let x = rs[0].left;
+        let width = rs[3].right - x;
         if width < slot * 6 || width > slot * 10 { return None; }
         // Do not draw over foreground full-screen apps.
         let fg = GetForegroundWindow();
@@ -64,6 +61,42 @@ fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
             return None;
         }
         Some((x,b.top+1,width,height-2))
+    }
+}
+
+// Shell_NotifyIconGetRect can return the overflow button's rectangle for a
+// hidden icon. Check the actual accessibility element separately before
+// drawing. The COM query runs off the preview window's message thread.
+fn overflow_rect() -> Option<(i32,i32,i32,i32)> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, TreeScope_Descendants};
+    unsafe {
+        let init = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let result = (|| -> windows::core::Result<Option<(i32,i32,i32,i32)>> {
+            let bar=FindWindowW(w!("Shell_TrayWnd"),None)?;
+            let uia:IUIAutomation=CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)?;
+            let root=uia.ElementFromHandle(bar)?;
+            let all=root.FindAll(TreeScope_Descendants,&uia.CreateTrueCondition()?)?;
+            let mut best:Option<(i32,i32,i32,i32)>=None;
+            let mut br=RECT::default();
+            GetWindowRect(bar,&mut br)?;
+            for i in 0..all.Length()? {
+                let e=all.GetElement(i)?;
+                let name=e.CurrentName().map(|s|s.to_string().to_lowercase()).unwrap_or_default();
+                let id=e.CurrentAutomationId().map(|s|s.to_string().to_lowercase()).unwrap_or_default();
+                if !(name.contains("hidden icons") || name.contains("iconos ocultos") ||
+                    name.contains("iconos escondidos") || id.contains("chevron") ||
+                    id.contains("overflowbutton")) {continue;}
+                let r=e.CurrentBoundingRectangle()?;
+                if r.left<br.left || r.right>br.right || r.top<br.top || r.bottom>br.bottom ||
+                    r.right<=r.left || r.bottom<=r.top || r.right-r.left>80 {continue;}
+                let v=(r.left,r.top,r.right,r.bottom);
+                if best.is_none_or(|b|v.0<b.0) {best=Some(v);}
+            }
+            Ok(best)
+        })();
+        if init {CoUninitialize();}
+        result.ok().flatten()
     }
 }
 
@@ -278,14 +311,14 @@ fn main() {
         let and=vec![255u8;bytes]; let xor=vec![0u8;bytes];
         let Ok(blank)=CreateIcon(Some(inst.into()),slot,slot,1,1,and.as_ptr(),xor.as_ptr()) else {let _=DestroyWindow(overlay);let _=DestroyWindow(owner);return;};
         let mut anchors=Vec::new();
-        for id in 1..=5u32 {
+        for id in 1..=4u32 {
             let Some(marker)=ui::number_icon(&id.to_string(),color,-1,slot,light) else {continue;};
             let mut data=NOTIFYICONDATAW{cbSize:size_of::<NOTIFYICONDATAW>() as u32,hWnd:owner,uID:id,uFlags:NIF_ICON|NIF_TIP,hIcon:marker,..Default::default()};
             ui::fill_wide(&mut data.szTip,&format!("Hybrid PREVIEW anchor {id}"));
             if Shell_NotifyIconW(NIM_ADD,&data).as_bool() {anchors.push(Anchor{data,marker});} else {let _=DestroyIcon(marker);}
         }
         println!("Hybrid preview: {} anchors. Drag numbered icons together to the visible tray.",anchors.len());
-        println!("Only when adjacent: leave the leftmost anchor clear for Windows, then show 49% and 95% (charging).");
+        println!("Four visible adjacent anchors and a verified clear overflow button are required.");
         println!("Press ENTER to remove all preview icons and the overlay.");
         let raw=owner.0 as isize;
         std::thread::spawn(move||{let mut s=String::new();let _=std::io::stdin().read_line(&mut s);let _=PostMessageW(Some(HWND(raw as *mut core::ffi::c_void)),WM_CLOSE,WPARAM(0),LPARAM(0));});
@@ -293,6 +326,12 @@ fn main() {
         let mut active=None;
         let mut previous=None;
         let mut last_rects = Vec::new();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let mut probe_pending=false;
+        let mut checked=None;
+        let mut checked_geom=None;
+        let mut checked_at=std::time::Instant::now();
+        let mut last_guard=None;
         let mut msg=MSG::default();
         while GetMessageW(&mut msg,None,0,0).0>0 {
             if msg.message==WM_TIMER && msg.hwnd==owner {
@@ -301,7 +340,28 @@ fn main() {
                     println!("Anchor rectangles: {rects:?}");
                     last_rects = rects;
                 }
-                let candidate=layout(&anchors,slot);
+                let geometry=layout(&anchors,slot);
+                if let Ok((g,r))=rx.try_recv() {
+                    probe_pending=false;
+                    checked_geom=g;
+                    checked=r;
+                    checked_at=std::time::Instant::now();
+                    if last_guard!=Some((g,r)) {
+                        println!("Overflow check: geometry={g:?}, button={r:?}");
+                        last_guard=Some((g,r));
+                    }
+                }
+                if geometry.is_some() && !probe_pending &&
+                    (checked_geom!=geometry || checked_at.elapsed().as_millis()>=1000) {
+                    probe_pending=true;
+                    let tx=tx.clone();
+                    std::thread::spawn(move||{let _=tx.send((geometry,overflow_rect()));});
+                }
+                // Fail closed on an unknown or stale chevron; never cover it.
+                let candidate=geometry.filter(|g| {
+                    checked_geom==geometry && checked_at.elapsed().as_millis()<2500 &&
+                        checked.is_some_and(|r|g.0>=r.2)
+                });
                 // Require stable geometry before displaying. Hide immediately when anchors move.
                 if candidate!=active && active.is_some() {
                     let _=ShowWindow(overlay,SW_HIDE);
