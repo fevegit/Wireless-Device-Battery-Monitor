@@ -107,6 +107,7 @@ fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), color: COLORREF, slot: i32) -> boo
             SelectObject(dc,HGDIOBJ(number_f.0));
             ui::draw_text(dc,text,&mut num,flags);
         }
+        let _ = GdiFlush();
         let (r,g,b) = ui::split(color);
         for p in px.iter_mut() {
             let a = (*p & 255).max((*p>>8)&255).max((*p>>16)&255);
@@ -157,9 +158,15 @@ fn main() {
         SetTimer(Some(owner),1,250,None);
         let mut active=None;
         let mut previous=None;
+        let mut last_rects = Vec::new();
         let mut msg=MSG::default();
         while GetMessageW(&mut msg,None,0,0).0>0 {
             if msg.message==WM_TIMER && msg.hwnd==owner {
+                let rects: Vec<_> = anchors.iter().map(|a| rect_of(a).map(|r| (r.left,r.top,r.right,r.bottom))).collect();
+                if rects != last_rects {
+                    println!("Anchor rectangles: {rects:?}");
+                    last_rects = rects;
+                }
                 let candidate=layout(&anchors,slot);
                 // Require stable geometry before displaying. Hide immediately when anchors move.
                 if candidate!=active && active.is_some() {
