@@ -75,65 +75,186 @@ fn set_anchor_icons(anchors: &[Anchor], blank: Option<HICON>) -> bool {
     ok
 }
 
-fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), color: COLORREF, slot: i32) -> bool {
-    let (x,y,width,height) = geom;
+/// Ink coverage of `text`, cropped to the drawn pixels. Same technique as the original widget:
+/// ClearType text, white on black (black on white for a light taskbar), coverage = RGB average.
+struct Mask {
+    w: i32,
+    h: i32,
+    a: Vec<u8>,
+}
+
+fn mask(text: &str, font: HFONT, dark_on_light: bool) -> Mask {
     unsafe {
-        let screen = GetDC(None);
-        let dc = CreateCompatibleDC(Some(screen));
+        let dc = CreateCompatibleDC(None);
+        let old_f = SelectObject(dc, HGDIOBJ(font.0));
+        let wtext: Vec<u16> = text.encode_utf16().collect();
+        let mut sz = SIZE::default();
+        let _ = GetTextExtentPoint32W(dc, &wtext, &mut sz);
+        let (w, h) = (sz.cx + 8, sz.cy + 8);
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: width, biHeight: -height,
-                biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default()
-            }, ..Default::default()
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
-            let _ = DeleteDC(dc); let _ = ReleaseDC(None, screen); return false;
+        let mut out = Mask { w: 0, h: 0, a: Vec::new() };
+        if let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old_b = SelectObject(dc, HGDIOBJ(bmp.0));
+            let px = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+            px.fill(if dark_on_light { 0xFFFF_FFFF } else { 0 });
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, if dark_on_light { ui::rgb(0, 0, 0) } else { ui::rgb(255, 255, 255) });
+            let _ = TextOutW(dc, 4, 4, &wtext);
+            let _ = GdiFlush();
+            let cover = |v: u32| -> u8 {
+                let c = ((v & 0xFF) + ((v >> 8) & 0xFF) + ((v >> 16) & 0xFF)) / 3;
+                (if dark_on_light { 255 - c } else { c }) as u8
+            };
+            let (mut x0, mut y0, mut x1, mut y1) = (w, h, -1, -1);
+            for y in 0..h {
+                for x in 0..w {
+                    if cover(px[(y * w + x) as usize]) != 0 {
+                        x0 = x0.min(x);
+                        x1 = x1.max(x);
+                        y0 = y0.min(y);
+                        y1 = y1.max(y);
+                    }
+                }
+            }
+            if x1 >= 0 {
+                out.w = x1 - x0 + 1;
+                out.h = y1 - y0 + 1;
+                out.a = Vec::with_capacity((out.w * out.h) as usize);
+                for y in 0..out.h {
+                    for x in 0..out.w {
+                        out.a.push(cover(px[((y0 + y) * w + x0 + x) as usize]));
+                    }
+                }
+            }
+            SelectObject(dc, old_b);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+        }
+        SelectObject(dc, old_f);
+        let _ = DeleteDC(dc);
+        out
+    }
+}
+
+/// Creates a ClearType font, falling back when the preferred face is not installed (GDI would
+/// otherwise silently substitute another face).
+fn make_font(px: i32, weight: i32, face: &str, fallback: &str, fallback_px: i32) -> HFONT {
+    for (f, size) in [(face, px), (fallback, if fallback_px > 0 { fallback_px } else { px })] {
+        unsafe {
+            let h = CreateFontW(
+                -size,
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                0,
+                &windows::core::HSTRING::from(f),
+            );
+            if f == fallback {
+                return h;
+            }
+            let dc = CreateCompatibleDC(None);
+            let o = SelectObject(dc, HGDIOBJ(h.0));
+            let mut got = [0u16; 64];
+            GetTextFaceW(dc, Some(&mut got));
+            SelectObject(dc, o);
+            let _ = DeleteDC(dc);
+            if batteryhub::util::from_wide(&got).eq_ignore_ascii_case(f) {
+                return h;
+            }
+            let _ = DeleteObject(HGDIOBJ(h.0));
+        }
+    }
+    unreachable!()
+}
+
+// The static renderer below ports the ink-mask and font routines from the
+// published experimental XAML contribution. Only presentation is external.
+fn paint(hwnd: HWND, geom: (i32,i32,i32,i32), _color: COLORREF, _slot: i32) -> bool {
+    let (x,y,width,height) = geom;
+    unsafe {
+        let bar = FindWindowW(w!("Shell_TrayWnd"), None).ok();
+        let dpi = bar.map(|b| windows::Win32::UI::HiDpi::GetDpiForWindow(b)).unwrap_or(96).max(96);
+        let scale = dpi as f32 / 96.0;
+        let px = |v: f32| (v * scale).round() as i32;
+        let light = ui::taskbar_is_light();
+        let fg = if light { ui::rgb(0,0,0) } else { ui::rgb(255,255,255) };
+        let icons = make_font(px(16.0),400,"Segoe Fluent Icons","Segoe MDL2 Assets",0);
+        let text = make_font(px(13.0),400,"Segoe UI Variable Text","Segoe UI",px(12.0));
+        let bolt = make_font(px(11.0),400,"Segoe Fluent Icons","Segoe MDL2 Assets",0);
+        let pieces = [
+            (mask(&DeviceKind::Headset.glyph().to_string(),icons,light),fg,px(5.0)),
+            (mask("49%",text,light),fg,px(14.0)),
+            (mask(&DeviceKind::Mouse.glyph().to_string(),icons,light),fg,px(5.0)),
+            (mask("95%",text,light),fg,px(2.0)),
+            (mask("\u{E945}",bolt,light),ui::charging_color(light),0),
+        ];
+        for f in [icons,text,bolt] {let _=DeleteObject(HGDIOBJ(f.0));}
+        let content: i32 = pieces.iter().map(|(m,_,gap)|m.w+gap).sum();
+        if content > width || pieces.iter().any(|(m,_,_)|m.w==0 || m.h>height) {
+            println!("XAML renderer content {}px does not fit {}px or a mask is empty",content,width);
+            return false;
+        }
+        let mut pixels=vec![0x0100_0000u32;(width*height) as usize];
+        let mut left=(width-content)/2;
+        for (m,c,gap) in &pieces {
+            let top=(height-m.h)/2;
+            let (r,g,b)=ui::split(*c);
+            for yy in 0..m.h {for xx in 0..m.w {
+                let a=m.a[(yy*m.w+xx) as usize] as u32;
+                if a==0 {continue;}
+                let d=&mut pixels[((top+yy)*width+left+xx) as usize];
+                let inv=255-a;
+                let ch=|src:u8,shift:u32| ((src as u32*a+((*d>>shift)&255)*inv)/255)&255;
+                let na=(a+((*d>>24)&255)*inv/255).min(255);
+                *d=na<<24|ch(r,16)<<16|ch(g,8)<<8|ch(b,0);
+            }}
+            left+=m.w+gap;
+        }
+        let screen=GetDC(None);
+        let dc=CreateCompatibleDC(Some(screen));
+        let bmi=BITMAPINFO{
+            bmiHeader:BITMAPINFOHEADER{
+                biSize:size_of::<BITMAPINFOHEADER>() as u32,biWidth:width,biHeight:-height,
+                biPlanes:1,biBitCount:32,biCompression:BI_RGB.0,..Default::default()
+            },..Default::default()
         };
-        let old = SelectObject(dc, HGDIOBJ(bmp.0));
-        let px = std::slice::from_raw_parts_mut(bits as *mut u32, (width*height) as usize);
-        px.fill(0);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, ui::rgb(255,255,255));
-        // Match the Personal-XAML screenshot: device glyph and percentage side by side.
-        let glyph_f = ui::font(slot, 400, ui::icon_font_face());
-        let number_f = ui::font((slot*7/8).max(12), 400, "Segoe UI");
-        let flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-        for (i, kind, text) in [(0,DeviceKind::Headset,"85%"), (1,DeviceKind::Mouse,"72%")] {
-            let l = width*i/2;
-            let r = width*(i+1)/2;
-            let center = (l+r)/2;
-            let glyph_w = slot + 2;
-            let num_w = slot*2;
-            let start = (center-(glyph_w+num_w+3)/2).max(l);
-            let mut icon = RECT {left:start, top:0, right:start+glyph_w, bottom:height};
-            let mut num = RECT {left:start+glyph_w+3, top:0, right:r, bottom:height};
-            SelectObject(dc,HGDIOBJ(glyph_f.0));
-            ui::draw_text(dc,&kind.glyph().to_string(),&mut icon,flags);
-            SelectObject(dc,HGDIOBJ(number_f.0));
-            ui::draw_text(dc,text,&mut num,flags);
-        }
-        let _ = GdiFlush();
-        let (r,g,b) = ui::split(color);
-        for p in px.iter_mut() {
-            let a = (*p & 255).max((*p>>8)&255).max((*p>>16)&255);
-            *p = (a<<24) | (((r as u32*a)/255)<<16) | (((g as u32*a)/255)<<8) | ((b as u32*a)/255);
-        }
-        let pt = POINT{x,y};
-        let src = POINT{x:0,y:0};
-        let sz = SIZE{cx:width,cy:height};
-        let blend = BLENDFUNCTION{BlendOp:AC_SRC_OVER as u8, BlendFlags:0, SourceConstantAlpha:255, AlphaFormat:AC_SRC_ALPHA as u8};
-        let ink = px.iter().filter(|&&p| p >> 24 != 0).count();
-        let result = UpdateLayeredWindow(hwnd,Some(screen),Some(&pt),Some(&sz),Some(dc),Some(&src),COLORREF(0),Some(&blend),ULW_ALPHA);
-        println!("Paint: {ink} visible pixels; UpdateLayeredWindow={result:?}");
-        let ok = ink > 0 && result.is_ok();
+        let mut bits:*mut core::ffi::c_void=std::ptr::null_mut();
+        let Ok(bmp)=CreateDIBSection(Some(dc),&bmi,DIB_RGB_COLORS,&mut bits,None,0) else {
+            let _=DeleteDC(dc);let _=ReleaseDC(None,screen);return false;
+        };
+        let old=SelectObject(dc,HGDIOBJ(bmp.0));
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(),bits as *mut u32,pixels.len());
+        let pt=POINT{x,y};
+        let src=POINT::default();
+        let sz=SIZE{cx:width,cy:height};
+        let blend=BLENDFUNCTION{BlendOp:AC_SRC_OVER as u8,BlendFlags:0,SourceConstantAlpha:255,AlphaFormat:AC_SRC_ALPHA as u8};
+        let result=UpdateLayeredWindow(hwnd,Some(screen),Some(&pt),Some(&sz),Some(dc),Some(&src),COLORREF(0),Some(&blend),ULW_ALPHA);
+        let ink=pixels.iter().filter(|&&p|p>>24>1).count();
+        println!("XAML mask renderer: dpi={dpi}, content={content}px, slot={width}px, ink={ink}, result={result:?}");
         SelectObject(dc,old);
-        let _=DeleteObject(HGDIOBJ(glyph_f.0));
-        let _=DeleteObject(HGDIOBJ(number_f.0));
         let _=DeleteObject(HGDIOBJ(bmp.0));
         let _=DeleteDC(dc);
         let _=ReleaseDC(None,screen);
-        ok
+        ink>0 && result.is_ok()
     }
 }
 
@@ -161,7 +282,7 @@ fn main() {
             if Shell_NotifyIconW(NIM_ADD,&data).as_bool() {anchors.push(Anchor{data,marker});} else {let _=DestroyIcon(marker);}
         }
         println!("Hybrid preview: {} anchors. Drag numbered icons together to the visible tray.",anchors.len());
-        println!("Only when adjacent: show external widget with synthetic 85% and 72%.");
+        println!("Only when adjacent: show external widget with synthetic 49% and 95% (charging).");
         println!("Press ENTER to remove all preview icons and the overlay.");
         let raw=owner.0 as isize;
         std::thread::spawn(move||{let mut s=String::new();let _=std::io::stdin().read_line(&mut s);let _=PostMessageW(Some(HWND(raw as *mut core::ffi::c_void)),WM_CLOSE,WPARAM(0),LPARAM(0));});
