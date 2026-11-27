@@ -426,20 +426,35 @@ fn main() {
                         checked.is_some_and(|r|g.0>=r.2)
                 });
                 let allowed=shell_allows_overlay();
-                // Explorer manages the owned popup's z-order. If the shell
-                // lowers itself, only hide if the popup failed to follow it.
                 let overlay_topmost=GetWindowLongW(overlay,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
-                let safe_band=allowed || !overlay_topmost;
-                let candidate=candidate.filter(|_|safe_band);
-                // A validated move is rendered at its new location in one
-                // UpdateLayeredWindow call, without hiding the previous frame.
+                // An owned popup can remain topmost after Explorer leaves that
+                // band, or fall behind the shell when it returns. Explicitly
+                // synchronize the bands; do not hide merely because they differ.
+                if !allowed && overlay_topmost {
+                    let demoted=SetWindowPos(overlay,Some(HWND_NOTOPMOST),0,0,0,0,
+                        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER);
+                    if demoted.is_err() {
+                        let _=ShowWindow(overlay,SW_HIDE);
+                        active=None;
+                        rendered=None;
+                    }
+                    println!("Shell left topmost band: demote={demoted:?}");
+                }
+                // A new slot must be verified before drawing. Move and repaint
+                // atomically, including while the shell is in the normal band.
                 if let Some(g)=candidate {
-                    if active!=Some(g) && (active.is_some() || allowed) && paint(overlay,g,color,slot,state) {
-                        let placed=SetWindowPos(overlay,None,g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_SHOWWINDOW);
+                    if active!=Some(g) && paint(overlay,g,color,slot,state) {
+                        let band=if allowed {HWND_TOPMOST} else {HWND_NOTOPMOST};
+                        let placed=SetWindowPos(overlay,Some(band),g.0,g.1,g.2,g.3,
+                            SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_SHOWWINDOW);
                         if placed.is_ok() && IsWindowVisible(overlay).as_bool() {
                             active=Some(g);
                             rendered=Some(state);
-                            println!("Overlay active: x={} y={} width={} height={}",g.0,g.1,g.2,g.3);
+                            println!("Overlay active: x={} y={} width={} height={} shell_topmost={allowed}",g.0,g.1,g.2,g.3);
+                        } else {
+                            let _=ShowWindow(overlay,SW_HIDE);
+                            active=None;
+                            rendered=None;
                         }
                     }
                 }
@@ -447,7 +462,24 @@ fn main() {
                     let _=ShowWindow(overlay,SW_HIDE);
                     active=None;
                     rendered=None;
-                    println!("Overlay hidden: geometry={geometry:?}, checked={checked_geom:?}, chevron={checked:?}, guard_age_ms={}, shell_topmost={allowed}, overlay_topmost={overlay_topmost}",checked_at.elapsed().as_millis());
+                    println!("Overlay hidden: geometry={geometry:?}, checked={checked_geom:?}, chevron={checked:?}, guard_age_ms={}, shell_topmost={allowed}",checked_at.elapsed().as_millis());
+                }
+                if active.is_some() && allowed {
+                    // Verify ordering instead of trusting WS_VISIBLE. Do not
+                    // continuously raise above unrelated foreground windows.
+                    let topmost=GetWindowLongW(overlay,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+                    let mut behind_shell=false;
+                    let mut current=overlay;
+                    for _ in 0..128 {
+                        let Ok(prev)=GetWindow(current,GW_HWNDPREV) else {break;};
+                        if prev==bar {behind_shell=true;break;}
+                        current=prev;
+                    }
+                    if !topmost || behind_shell || !IsWindowVisible(overlay).as_bool() {
+                        let raised=SetWindowPos(overlay,Some(HWND_TOPMOST),0,0,0,0,
+                            SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_SHOWWINDOW);
+                        println!("Shell band recovery: topmost={topmost}, behind_shell={behind_shell}, result={raised:?}");
+                    }
                 }
                 if let Some(g)=active {
                     if rendered!=Some(state) {
