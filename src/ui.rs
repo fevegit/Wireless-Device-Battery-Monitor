@@ -115,6 +115,23 @@ pub fn draw_text(dc: HDC, text: &str, rc: &mut RECT, flags: windows::Win32::Grap
 /// Renders a square tray icon: the level number (or `?`) in `color`, with a thin level bar below.
 /// GDI text has no alpha, so it is drawn white-on-black and the luminance becomes the alpha.
 pub fn number_icon(text: &str, color: COLORREF, level: i32, size: i32, light: bool) -> Option<HICON> {
+    tray_number_icon(text, color, level, size, light, None)
+}
+
+/// Experimental native tray layout: a device glyph above its battery number.
+/// Windows owns the icon slot; the existing numeric layout remains the fallback.
+pub fn device_number_icon(text: &str, color: COLORREF, level: i32, size: i32, light: bool, glyph: char) -> Option<HICON> {
+    if size < 16 {
+        return number_icon(text, color, level, size, light);
+    }
+    tray_number_icon(text, color, level, size, light, Some(glyph))
+        .or_else(|| number_icon(text, color, level, size, light))
+}
+
+fn tray_number_icon(text: &str, color: COLORREF, level: i32, size: i32, light: bool, glyph: Option<char>) -> Option<HICON> {
+    if size <= 0 {
+        return None;
+    }
     unsafe {
         let dc = CreateCompatibleDC(None);
         let bmi = BITMAPINFO {
@@ -138,10 +155,22 @@ pub fn number_icon(text: &str, color: COLORREF, level: i32, size: i32, light: bo
         let px = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
         px.fill(0);
 
-        // Leave room for the level bar at the bottom.
-        let bar_h = (size / 8).max(2);
-        let text_h = size - bar_h - 1;
-        let mut height = text_h + size / 6;
+        // A native tray slot is square. In glyph mode use its top half for the
+        // device and the rest for digits, with no separate level bar.
+        let bar_h = if glyph.is_some() { 0 } else { (size / 8).max(2) };
+        let text_top = if glyph.is_some() { size / 2 } else { -1 };
+        let text_h = if glyph.is_some() { size } else { size - bar_h - 1 };
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, rgb(255, 255, 255));
+        if let Some(g) = glyph {
+            let gf = font((text_top - 1).max(6), 400, icon_font_face());
+            let before = SelectObject(dc, HGDIOBJ(gf.0));
+            let mut rect = RECT { left: 0, top: 0, right: size, bottom: text_top };
+            draw_text(dc, &g.to_string(), &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dc, before);
+            let _ = DeleteObject(HGDIOBJ(gf.0));
+        }
+        let mut height = if glyph.is_some() { text_h - text_top } else { text_h + size / 6 };
         let mut f = font(height, 700, "Segoe UI");
         let mut prev = SelectObject(dc, HGDIOBJ(f.0));
         while height > 6 && text_width(dc, text) > size {
@@ -153,7 +182,7 @@ pub fn number_icon(text: &str, color: COLORREF, level: i32, size: i32, light: bo
         }
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, rgb(255, 255, 255));
-        let mut rc = RECT { left: -2, top: -1, right: size + 2, bottom: text_h };
+        let mut rc = RECT { left: -2, top: text_top, right: size + 2, bottom: text_h };
         draw_text(dc, text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, prev);
         let _ = DeleteObject(HGDIOBJ(f.0));
@@ -163,8 +192,8 @@ pub fn number_icon(text: &str, color: COLORREF, level: i32, size: i32, light: bo
             let a = (*p & 0xFF).max((*p >> 8) & 0xFF).max((*p >> 16) & 0xFF);
             *p = premul(r, g, b, a as u8);
         }
-        // Level bar: faint track plus a filled part.
-        if level >= 0 {
+        // Level bar: faint track plus a filled part (numeric layout only).
+        if glyph.is_none() && level >= 0 {
             let track = if light { (0u8, 0u8, 0u8, 70u8) } else { (255, 255, 255, 70) };
             let fill_w = ((size - 2) * level.clamp(0, 100) + 50) / 100;
             for y in size - bar_h..size {
