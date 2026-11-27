@@ -28,6 +28,7 @@ fn rect_of(a: &Anchor) -> Option<RECT> {
 }
 
 type Geometry = (i32,i32,i32,i32);
+const WM_GUARD_READY:u32=WM_APP+31;
 
 fn layout(rects: &[Option<RECT>], slot: i32) -> Option<Geometry> {
     if rects.len() != 4 || slot <= 0 { return None; }
@@ -55,13 +56,8 @@ fn layout(rects: &[Option<RECT>], slot: i32) -> Option<Geometry> {
         let x = rs[0].left;
         let width = rs[3].right - x;
         if width < slot * 6 || width > slot * 10 { return None; }
-        // Do not draw over foreground full-screen apps.
-        let fg = GetForegroundWindow();
-        let mut f = RECT::default();
-        if !fg.0.is_null() && fg != bar && GetWindowRect(fg, &mut f).is_ok() &&
-            f.left <= x && f.right >= x+width && f.top <= b.top && f.bottom >= b.bottom {
-            return None;
-        }
+        // Geometry is independent of foreground windows. In particular the
+        // screenshot selection surface is monitor-sized but is not a game.
         Some((x,b.top+1,width,height-2))
     }
 }
@@ -69,7 +65,27 @@ fn layout(rects: &[Option<RECT>], slot: i32) -> Option<Geometry> {
 // Shell_NotifyIconGetRect can return the overflow button's rectangle for a
 // hidden icon. Check the actual accessibility element separately before
 // drawing. The COM query runs off the preview window's message thread.
+// Same fullscreen signal as the official BatteryHub widget: Explorer owns
+// the fullscreen decision. Do not classify by foreground-window dimensions.
+fn shell_allows_overlay()->bool {
+    unsafe {
+        FindWindowW(w!("Shell_TrayWnd"),None).is_ok_and(|bar|
+            IsWindowVisible(bar).as_bool() && GetWindowLongW(bar,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0)
+    }
+}
+
+// Do not raise above a foreground capture surface or other covering window.
+fn foreground_covers(g:Geometry)->bool {
+    unsafe {
+        let fg=GetForegroundWindow();
+        let mut r=RECT::default();
+        !fg.0.is_null() && GetWindowRect(fg,&mut r).is_ok() &&
+            r.left<=g.0 && r.right>=g.0+g.2 && r.top<=g.1 && r.bottom>=g.1+g.3
+    }
+}
+
 fn overflow_worker(
+    owner:isize,
     requests: std::sync::mpsc::Receiver<Geometry>,
     replies: std::sync::mpsc::Sender<(Option<Geometry>,Option<Geometry>)>,
 ) {
@@ -81,7 +97,6 @@ fn overflow_worker(
             let mut uia:Option<IUIAutomation>=None;
             let mut cached:Option<IUIAutomationElement>=None;
             let mut last_bar=HWND::default();
-            let mut last_geom=None;
             let mut last_scan=std::time::Instant::now();
             while let Ok(geom)=requests.recv() {
                 let result=(|| -> windows::core::Result<Option<Geometry>> {
@@ -101,7 +116,7 @@ fn overflow_worker(
                         name.contains("hidden icons") || name.contains("iconos ocultos") ||
                         name.contains("iconos escondidos") || id.contains("chevron") || id.contains("overflowbutton")
                     };
-                    if bar==last_bar && last_geom==Some(geom) && last_scan.elapsed().as_secs()<10 {
+                    if bar==last_bar && last_scan.elapsed().as_secs()<10 {
                         if let Some(e)=cached.as_ref() {
                             if matches(e) {
                                 if let Some(r)=bounds(e) {return Ok(Some(r));}
@@ -110,7 +125,6 @@ fn overflow_worker(
                     }
                     cached=None;
                     last_bar=bar;
-                    last_geom=Some(geom);
                     last_scan=std::time::Instant::now();
                     if uia.is_none() {uia=Some(CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)?);}
                     let uia=uia.as_ref().unwrap();
@@ -127,6 +141,7 @@ fn overflow_worker(
                     Ok(best)
                 })();
                 if replies.send((Some(geom),result.ok().flatten())).is_err() {break;}
+                let _=PostMessageW(Some(HWND(owner as *mut core::ffi::c_void)),WM_GUARD_READY,WPARAM(0),LPARAM(0));
             }
         }
         CoUninitialize();
@@ -369,11 +384,10 @@ fn main() {
         let mut rendered=None;
         if cycle {println!("QA cycle: synthetic battery state changes every 5 seconds.");}
         let mut active=None;
-        let mut previous=None;
         let mut last_rects = Vec::new();
         let (tx,rx)=std::sync::mpsc::channel();
         let (request_tx,request_rx)=std::sync::mpsc::channel();
-        std::thread::spawn(move||overflow_worker(request_rx,tx));
+        std::thread::spawn(move||overflow_worker(raw,request_rx,tx));
         let mut probe_pending=false;
         let mut checked=None;
         let mut checked_geom=None;
@@ -381,7 +395,7 @@ fn main() {
         let mut last_guard=None;
         let mut msg=MSG::default();
         while GetMessageW(&mut msg,None,0,0).0>0 {
-            if msg.message==WM_TIMER && msg.hwnd==owner {
+            if (msg.message==WM_TIMER || msg.message==WM_GUARD_READY) && msg.hwnd==owner {
                 let raw_rects: Vec<_> = anchors.iter().map(rect_of).collect();
                 let rects: Vec<_> = raw_rects.iter().map(|r| r.map(|r| (r.left,r.top,r.right,r.bottom))).collect();
                 if rects != last_rects {
@@ -409,15 +423,18 @@ fn main() {
                     checked_geom==geometry && checked_at.elapsed().as_millis()<2500 &&
                         checked.is_some_and(|r|g.0>=r.2)
                 });
-                // Require stable geometry before displaying. Hide immediately when anchors move.
+                let allowed=shell_allows_overlay();
+                let candidate=candidate.filter(|_|allowed);
+                // Hide immediately if the slot is no longer validated or Explorer
+                // has lowered the taskbar. No numbered icons are restored.
                 if candidate!=active && active.is_some() {
                     let _=ShowWindow(overlay,SW_HIDE);
                     active=None;
                     rendered=None;
-                    println!("Overlay temporarily hidden; anchors remain transparent.");
+                    println!("Overlay hidden: geometry={geometry:?}, checked={checked_geom:?}, chevron={checked:?}, guard_age_ms={}, shell_topmost={allowed}",checked_at.elapsed().as_millis());
                 }
                 if let Some(g)=candidate {
-                    if active.is_none() && previous==Some(g) && paint(overlay,g,color,slot,state) {
+                    if active.is_none() && !foreground_covers(g) && paint(overlay,g,color,slot,state) {
                         let raised = SetWindowPos(overlay,Some(HWND_TOPMOST),g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_SHOWWINDOW);
                         println!("Raise overlay: {raised:?}; visible={}",IsWindowVisible(overlay).as_bool());
                         if raised.is_ok() && IsWindowVisible(overlay).as_bool() {
@@ -441,7 +458,7 @@ fn main() {
                         }
                     }
                 }
-                if active.is_some() && candidate==active {
+                if active.is_some_and(|g| !foreground_covers(g)) && candidate==active {
                     // Only raise when Explorer is actually above this overlay.
                     // Avoid issuing redundant SetWindowPos calls four times a second.
                     if let Ok(bar)=FindWindowW(w!("Shell_TrayWnd"),None) {
@@ -456,7 +473,6 @@ fn main() {
                         }
                     }
                 }
-                previous=candidate;
             }
             let _=TranslateMessage(&msg);
             DispatchMessageW(&msg);
