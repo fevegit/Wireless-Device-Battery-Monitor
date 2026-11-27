@@ -74,16 +74,6 @@ fn shell_allows_overlay()->bool {
     }
 }
 
-// Do not raise above a foreground capture surface or other covering window.
-fn foreground_covers(g:Geometry)->bool {
-    unsafe {
-        let fg=GetForegroundWindow();
-        let mut r=RECT::default();
-        !fg.0.is_null() && GetWindowRect(fg,&mut r).is_ok() &&
-            r.left<=g.0 && r.right>=g.0+g.2 && r.top<=g.1 && r.bottom>=g.1+g.3
-    }
-}
-
 fn overflow_worker(
     owner:isize,
     requests: std::sync::mpsc::Receiver<Geometry>,
@@ -353,7 +343,11 @@ fn main() {
         let wc = WNDCLASSEXW{cbSize:size_of::<WNDCLASSEXW>() as u32,lpfnWndProc:Some(proc),hInstance:inst.into(),lpszClassName:class,..Default::default()};
         if RegisterClassExW(&wc)==0 { return; }
         let Ok(owner)=CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("BatteryHub Hybrid Preview"),WS_POPUP,0,0,0,0,None,None,Some(inst.into()),None) else {return;};
-        let Ok(overlay)=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,class,w!("BatteryHub Hybrid Overlay"),WS_POPUP,0,0,0,0,None,None,Some(inst.into()),None) else {let _=DestroyWindow(owner); return;};
+        let Ok(bar)=FindWindowW(w!("Shell_TrayWnd"),None) else {let _=DestroyWindow(owner);return;};
+        // The shell is the owner, not the parent: no injection or cross-process
+        // child reparenting. Inherit its z-order instead of fighting Explorer.
+        let Ok(overlay)=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,class,w!("BatteryHub Hybrid Overlay"),WS_POPUP,0,0,0,0,Some(bar),None,Some(inst.into()),None) else {let _=DestroyWindow(owner); return;};
+        println!("Shell-owned overlay: owner={:?}",GetWindow(overlay,GW_OWNER));
         let light = ui::taskbar_is_light();
         let color=if light {ui::rgb(20,20,20)} else {ui::rgb(255,255,255)};
         let slot=GetSystemMetricsForDpi(SM_CXSMICON,GetDpiForSystem()).clamp(16,64);
@@ -396,6 +390,10 @@ fn main() {
         let mut msg=MSG::default();
         while GetMessageW(&mut msg,None,0,0).0>0 {
             if (msg.message==WM_TIMER || msg.message==WM_GUARD_READY) && msg.hwnd==owner {
+                if !IsWindow(Some(overlay)).as_bool() || !IsWindow(Some(bar)).as_bool() {
+                    println!("Shell or overlay was destroyed; restart this isolated preview.");
+                    break;
+                }
                 let raw_rects: Vec<_> = anchors.iter().map(rect_of).collect();
                 let rects: Vec<_> = raw_rects.iter().map(|r| r.map(|r| (r.left,r.top,r.right,r.bottom))).collect();
                 if rects != last_rects {
@@ -406,9 +404,13 @@ fn main() {
                 let geometry=layout(&raw_rects,slot);
                 if let Ok((g,r))=rx.try_recv() {
                     probe_pending=false;
-                    checked_geom=g;
-                    checked=r;
-                    checked_at=std::time::Instant::now();
+                    // A transient UIA failure does not invalidate a previously
+                    // verified, unchanged slot. A real conflict or changed slot does.
+                    if r.is_some() || checked_geom!=g {
+                        checked_geom=g;
+                        checked=r;
+                        checked_at=std::time::Instant::now();
+                    }
                     if last_guard!=Some((g,r)) {
                         println!("Overflow check: geometry={g:?}, button={r:?}");
                         last_guard=Some((g,r));
@@ -420,31 +422,32 @@ fn main() {
                 }
                 // Fail closed on an unknown or stale chevron; never cover it.
                 let candidate=geometry.filter(|g| {
-                    checked_geom==geometry && checked_at.elapsed().as_millis()<2500 &&
+                    checked_geom==geometry && checked_at.elapsed().as_millis()<5000 &&
                         checked.is_some_and(|r|g.0>=r.2)
                 });
                 let allowed=shell_allows_overlay();
-                let candidate=candidate.filter(|_|allowed);
-                // Hide immediately if the slot is no longer validated or Explorer
-                // has lowered the taskbar. No numbered icons are restored.
-                if candidate!=active && active.is_some() {
-                    let _=ShowWindow(overlay,SW_HIDE);
-                    active=None;
-                    rendered=None;
-                    println!("Overlay hidden: geometry={geometry:?}, checked={checked_geom:?}, chevron={checked:?}, guard_age_ms={}, shell_topmost={allowed}",checked_at.elapsed().as_millis());
-                }
+                // Explorer manages the owned popup's z-order. If the shell
+                // lowers itself, only hide if the popup failed to follow it.
+                let overlay_topmost=GetWindowLongW(overlay,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+                let safe_band=allowed || !overlay_topmost;
+                let candidate=candidate.filter(|_|safe_band);
+                // A validated move is rendered at its new location in one
+                // UpdateLayeredWindow call, without hiding the previous frame.
                 if let Some(g)=candidate {
-                    if active.is_none() && !foreground_covers(g) && paint(overlay,g,color,slot,state) {
-                        let raised = SetWindowPos(overlay,Some(HWND_TOPMOST),g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-                        println!("Raise overlay: {raised:?}; visible={}",IsWindowVisible(overlay).as_bool());
-                        if raised.is_ok() && IsWindowVisible(overlay).as_bool() {
+                    if active!=Some(g) && (active.is_some() || allowed) && paint(overlay,g,color,slot,state) {
+                        let placed=SetWindowPos(overlay,None,g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_SHOWWINDOW);
+                        if placed.is_ok() && IsWindowVisible(overlay).as_bool() {
                             active=Some(g);
                             rendered=Some(state);
                             println!("Overlay active: x={} y={} width={} height={}",g.0,g.1,g.2,g.3);
-                        } else {
-                            let _=ShowWindow(overlay,SW_HIDE);
                         }
                     }
+                }
+                if active.is_some() && candidate!=active {
+                    let _=ShowWindow(overlay,SW_HIDE);
+                    active=None;
+                    rendered=None;
+                    println!("Overlay hidden: geometry={geometry:?}, checked={checked_geom:?}, chevron={checked:?}, guard_age_ms={}, shell_topmost={allowed}, overlay_topmost={overlay_topmost}",checked_at.elapsed().as_millis());
                 }
                 if let Some(g)=active {
                     if rendered!=Some(state) {
@@ -458,21 +461,7 @@ fn main() {
                         }
                     }
                 }
-                if active.is_some_and(|g| !foreground_covers(g)) && candidate==active {
-                    // Only raise when Explorer is actually above this overlay.
-                    // Avoid issuing redundant SetWindowPos calls four times a second.
-                    if let Ok(bar)=FindWindowW(w!("Shell_TrayWnd"),None) {
-                        let mut current=overlay;
-                        for _ in 0..128 {
-                            let Ok(prev)=GetWindow(current,GW_HWNDPREV) else {break;};
-                            if prev==bar {
-                                let _=SetWindowPos(overlay,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-                                break;
-                            }
-                            current=prev;
-                        }
-                    }
-                }
+
             }
             let _=TranslateMessage(&msg);
             DispatchMessageW(&msg);
