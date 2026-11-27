@@ -5,7 +5,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::Shell::{NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconW, Shell_NotifyIconGetRect};
+use windows::Win32::UI::Shell::{NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconW, Shell_NotifyIconGetRect};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
@@ -131,17 +131,6 @@ fn overflow_worker(
         }
         CoUninitialize();
     }
-}
-
-fn set_anchor_icons(anchors: &[Anchor], blank: Option<HICON>) -> bool {
-    let mut ok = true;
-    for a in anchors {
-        let mut d = a.data;
-        d.uFlags = NIF_ICON;
-        d.hIcon = blank.unwrap_or(a.marker);
-        ok &= unsafe { Shell_NotifyIconW(NIM_MODIFY, &d).as_bool() };
-    }
-    ok
 }
 
 /// Ink coverage of `text`, cropped to the drawn pixels. Same technique as the original widget:
@@ -357,19 +346,24 @@ fn main() {
         let bytes=(((slot as usize+15)/16)*2)*slot as usize;
         let and=vec![255u8;bytes]; let xor=vec![0u8;bytes];
         let Ok(blank)=CreateIcon(Some(inst.into()),slot,slot,1,1,and.as_ptr(),xor.as_ptr()) else {let _=DestroyWindow(overlay);let _=DestroyWindow(owner);return;};
+        // Numbered markers are a deliberate setup-only mode. Normal preview
+        // anchors must stay transparent even during capture/foreground changes.
+        let setup_anchors=std::env::args().any(|a|a=="--anchors");
         let mut anchors=Vec::new();
         for id in 1..=4u32 {
             let Some(marker)=ui::number_icon(&id.to_string(),color,-1,slot,light) else {continue;};
-            let mut data=NOTIFYICONDATAW{cbSize:size_of::<NOTIFYICONDATAW>() as u32,hWnd:owner,uID:id,uFlags:NIF_ICON|NIF_TIP,hIcon:marker,..Default::default()};
+            let mut data=NOTIFYICONDATAW{cbSize:size_of::<NOTIFYICONDATAW>() as u32,hWnd:owner,uID:id,uFlags:NIF_ICON|NIF_TIP,hIcon:if setup_anchors {marker} else {blank},..Default::default()};
             ui::fill_wide(&mut data.szTip,&format!("Hybrid PREVIEW anchor {id}"));
             if Shell_NotifyIconW(NIM_ADD,&data).as_bool() {anchors.push(Anchor{data,marker});} else {let _=DestroyIcon(marker);}
         }
-        println!("Hybrid preview: {} anchors. Drag numbered icons together to the visible tray.",anchors.len());
+        println!("Hybrid preview: {} anchors ({}).",anchors.len(),if setup_anchors {"setup markers"} else {"transparent"});
+        if setup_anchors {println!("Drag numbered icons together, then press ENTER and restart without --anchors.");}
+        else {println!("If the overlay cannot activate, restart with --anchors to arrange the slots.");}
         println!("Four visible adjacent anchors and a verified clear overflow button are required.");
         println!("Press ENTER to remove all preview icons and the overlay.");
         let raw=owner.0 as isize;
         std::thread::spawn(move||{let mut s=String::new();let _=std::io::stdin().read_line(&mut s);let _=PostMessageW(Some(HWND(raw as *mut core::ffi::c_void)),WM_CLOSE,WPARAM(0),LPARAM(0));});
-        SetTimer(Some(owner),1,250,None);
+        if !setup_anchors {SetTimer(Some(owner),1,250,None);}
         let cycle=std::env::args().any(|a|a=="--cycle");
         let started=std::time::Instant::now();
         let mut rendered=None;
@@ -418,22 +412,20 @@ fn main() {
                 // Require stable geometry before displaying. Hide immediately when anchors move.
                 if candidate!=active && active.is_some() {
                     let _=ShowWindow(overlay,SW_HIDE);
-                    set_anchor_icons(&anchors,None);
                     active=None;
                     rendered=None;
-                    println!("Overlay hidden; anchors restored.");
+                    println!("Overlay temporarily hidden; anchors remain transparent.");
                 }
                 if let Some(g)=candidate {
                     if active.is_none() && previous==Some(g) && paint(overlay,g,color,slot,state) {
                         let raised = SetWindowPos(overlay,Some(HWND_TOPMOST),g.0,g.1,g.2,g.3,SWP_NOACTIVATE|SWP_SHOWWINDOW);
                         println!("Raise overlay: {raised:?}; visible={}",IsWindowVisible(overlay).as_bool());
-                        if raised.is_ok() && IsWindowVisible(overlay).as_bool() && set_anchor_icons(&anchors,Some(blank)) {
+                        if raised.is_ok() && IsWindowVisible(overlay).as_bool() {
                             active=Some(g);
                             rendered=Some(state);
                             println!("Overlay active: x={} y={} width={} height={}",g.0,g.1,g.2,g.3);
                         } else {
                             let _=ShowWindow(overlay,SW_HIDE);
-                            set_anchor_icons(&anchors,None);
                         }
                     }
                 }
@@ -444,7 +436,6 @@ fn main() {
                             println!("QA rendered: {state:?}");
                         } else {
                             let _=ShowWindow(overlay,SW_HIDE);
-                            set_anchor_icons(&anchors,None);
                             active=None;
                             rendered=None;
                         }
