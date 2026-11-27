@@ -27,8 +27,10 @@ fn rect_of(a: &Anchor) -> Option<RECT> {
     unsafe { Shell_NotifyIconGetRect(&id).ok() }
 }
 
-fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
-    if anchors.len() != 4 || slot <= 0 { return None; }
+type Geometry = (i32,i32,i32,i32);
+
+fn layout(rects: &[Option<RECT>], slot: i32) -> Option<Geometry> {
+    if rects.len() != 4 || slot <= 0 { return None; }
     unsafe {
         let bar = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         if !IsWindowVisible(bar).as_bool() { return None; }
@@ -36,7 +38,7 @@ fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
         GetWindowRect(bar, &mut b).ok()?;
         let height = b.bottom - b.top;
         if height < 24 || height > slot * 5 || b.right - b.left < height * 4 { return None; }
-        let mut rs: Vec<RECT> = anchors.iter().map(rect_of).collect::<Option<Vec<_>>>()?;
+        let mut rs: Vec<RECT> = rects.iter().copied().collect::<Option<Vec<_>>>()?;
         rs.sort_by_key(|r| r.left);
         if rs.iter().any(|r| r.left < b.left || r.right > b.right || r.top < b.top || r.bottom > b.bottom
             || r.right <= r.left || r.bottom <= r.top || r.right-r.left > slot*3 || r.bottom-r.top > height) {
@@ -67,36 +69,67 @@ fn layout(anchors: &[Anchor], slot: i32) -> Option<(i32,i32,i32,i32)> {
 // Shell_NotifyIconGetRect can return the overflow button's rectangle for a
 // hidden icon. Check the actual accessibility element separately before
 // drawing. The COM query runs off the preview window's message thread.
-fn overflow_rect() -> Option<(i32,i32,i32,i32)> {
+fn overflow_worker(
+    requests: std::sync::mpsc::Receiver<Geometry>,
+    replies: std::sync::mpsc::Sender<(Option<Geometry>,Option<Geometry>)>,
+) {
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
-    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, TreeScope_Descendants};
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomationElement, TreeScope_Descendants};
     unsafe {
-        let init = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-        let result = (|| -> windows::core::Result<Option<(i32,i32,i32,i32)>> {
-            let bar=FindWindowW(w!("Shell_TrayWnd"),None)?;
-            let uia:IUIAutomation=CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)?;
-            let root=uia.ElementFromHandle(bar)?;
-            let all=root.FindAll(TreeScope_Descendants,&uia.CreateTrueCondition()?)?;
-            let mut best:Option<(i32,i32,i32,i32)>=None;
-            let mut br=RECT::default();
-            GetWindowRect(bar,&mut br)?;
-            for i in 0..all.Length()? {
-                let e=all.GetElement(i)?;
-                let name=e.CurrentName().map(|s|s.to_string().to_lowercase()).unwrap_or_default();
-                let id=e.CurrentAutomationId().map(|s|s.to_string().to_lowercase()).unwrap_or_default();
-                if !(name.contains("hidden icons") || name.contains("iconos ocultos") ||
-                    name.contains("iconos escondidos") || id.contains("chevron") ||
-                    id.contains("overflowbutton")) {continue;}
-                let r=e.CurrentBoundingRectangle()?;
-                if r.left<br.left || r.right>br.right || r.top<br.top || r.bottom>br.bottom ||
-                    r.right<=r.left || r.bottom<=r.top || r.right-r.left>80 {continue;}
-                let v=(r.left,r.top,r.right,r.bottom);
-                if best.is_none_or(|b|v.0<b.0) {best=Some(v);}
+        if CoInitializeEx(None,COINIT_MULTITHREADED).is_err() {return;}
+        {
+            let mut uia:Option<IUIAutomation>=None;
+            let mut cached:Option<IUIAutomationElement>=None;
+            let mut last_bar=HWND::default();
+            let mut last_geom=None;
+            let mut last_scan=std::time::Instant::now();
+            while let Ok(geom)=requests.recv() {
+                let result=(|| -> windows::core::Result<Option<Geometry>> {
+                    let bar=FindWindowW(w!("Shell_TrayWnd"),None)?;
+                    let mut br=RECT::default();
+                    GetWindowRect(bar,&mut br)?;
+                    let bounds=|e:&IUIAutomationElement| -> Option<Geometry> {
+                        if e.CurrentIsOffscreen().ok()?.as_bool() {return None;}
+                        let r=e.CurrentBoundingRectangle().ok()?;
+                        if r.left<br.left || r.right>br.right || r.top<br.top || r.bottom>br.bottom ||
+                            r.right<=r.left || r.bottom<=r.top || r.right-r.left>80 {return None;}
+                        Some((r.left,r.top,r.right,r.bottom))
+                    };
+                    let matches=|e:&IUIAutomationElement| {
+                        let name=e.CurrentName().map(|s|s.to_string().to_lowercase()).unwrap_or_default();
+                        let id=e.CurrentAutomationId().map(|s|s.to_string().to_lowercase()).unwrap_or_default();
+                        name.contains("hidden icons") || name.contains("iconos ocultos") ||
+                        name.contains("iconos escondidos") || id.contains("chevron") || id.contains("overflowbutton")
+                    };
+                    if bar==last_bar && last_geom==Some(geom) && last_scan.elapsed().as_secs()<10 {
+                        if let Some(e)=cached.as_ref() {
+                            if matches(e) {
+                                if let Some(r)=bounds(e) {return Ok(Some(r));}
+                            }
+                        }
+                    }
+                    cached=None;
+                    last_bar=bar;
+                    last_geom=Some(geom);
+                    last_scan=std::time::Instant::now();
+                    if uia.is_none() {uia=Some(CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)?);}
+                    let uia=uia.as_ref().unwrap();
+                    let root=uia.ElementFromHandle(bar)?;
+                    let all=root.FindAll(TreeScope_Descendants,&uia.CreateTrueCondition()?)?;
+                    let mut best:Option<Geometry>=None;
+                    for i in 0..all.Length()? {
+                        let e=all.GetElement(i)?;
+                        if !matches(&e) {continue;}
+                        if let Some(v)=bounds(&e) {
+                            if best.is_none_or(|b|v.0<b.0) {best=Some(v);cached=Some(e);}
+                        }
+                    }
+                    Ok(best)
+                })();
+                if replies.send((Some(geom),result.ok().flatten())).is_err() {break;}
             }
-            Ok(best)
-        })();
-        if init {CoUninitialize();}
-        result.ok().flatten()
+        }
+        CoUninitialize();
     }
 }
 
@@ -345,6 +378,8 @@ fn main() {
         let mut previous=None;
         let mut last_rects = Vec::new();
         let (tx,rx)=std::sync::mpsc::channel();
+        let (request_tx,request_rx)=std::sync::mpsc::channel();
+        std::thread::spawn(move||overflow_worker(request_rx,tx));
         let mut probe_pending=false;
         let mut checked=None;
         let mut checked_geom=None;
@@ -353,13 +388,14 @@ fn main() {
         let mut msg=MSG::default();
         while GetMessageW(&mut msg,None,0,0).0>0 {
             if msg.message==WM_TIMER && msg.hwnd==owner {
-                let rects: Vec<_> = anchors.iter().map(|a| rect_of(a).map(|r| (r.left,r.top,r.right,r.bottom))).collect();
+                let raw_rects: Vec<_> = anchors.iter().map(rect_of).collect();
+                let rects: Vec<_> = raw_rects.iter().map(|r| r.map(|r| (r.left,r.top,r.right,r.bottom))).collect();
                 if rects != last_rects {
                     println!("Anchor rectangles: {rects:?}");
                     last_rects = rects;
                 }
                 let state=DEMO_STATES[if cycle {(started.elapsed().as_secs()/5) as usize % DEMO_STATES.len()} else {0}];
-                let geometry=layout(&anchors,slot);
+                let geometry=layout(&raw_rects,slot);
                 if let Ok((g,r))=rx.try_recv() {
                     probe_pending=false;
                     checked_geom=g;
@@ -372,9 +408,7 @@ fn main() {
                 }
                 if geometry.is_some() && !probe_pending &&
                     (checked_geom!=geometry || checked_at.elapsed().as_millis()>=1000) {
-                    probe_pending=true;
-                    let tx=tx.clone();
-                    std::thread::spawn(move||{let _=tx.send((geometry,overflow_rect()));});
+                    probe_pending=request_tx.send(geometry.unwrap()).is_ok();
                 }
                 // Fail closed on an unknown or stale chevron; never cover it.
                 let candidate=geometry.filter(|g| {
@@ -417,8 +451,19 @@ fn main() {
                     }
                 }
                 if active.is_some() && candidate==active {
-                    // Explorer can raise its own topmost window after shell layout changes.
-                    let _=SetWindowPos(overlay,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                    // Only raise when Explorer is actually above this overlay.
+                    // Avoid issuing redundant SetWindowPos calls four times a second.
+                    if let Ok(bar)=FindWindowW(w!("Shell_TrayWnd"),None) {
+                        let mut current=overlay;
+                        for _ in 0..128 {
+                            let Ok(prev)=GetWindow(current,GW_HWNDPREV) else {break;};
+                            if prev==bar {
+                                let _=SetWindowPos(overlay,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+                                break;
+                            }
+                            current=prev;
+                        }
+                    }
                 }
                 previous=candidate;
             }
